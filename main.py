@@ -1,166 +1,196 @@
-"""Pipeline simple et extensible (version adaptée aux coûts simples).
-
-Objectif
---------
-Adapter le pipeline pour utiliser des modules de coûts **simples** qui
-implémentent la méthode `apply(df: pd.DataFrame) -> pd.DataFrame` (comme
-`CarbonCost` et `EnergyCost` fournis précédemment).
-
-Principes
-- Le pipeline reste minimaliste et lisible.
-- Les modules de coûts sont des objets simples : `module.apply(df)`.
-- Le pipeline applique les coûts **sur le bilan historique** ET **sur le bilan projeté**
-  et retourne les deux DataFrames (non-stressé / projeté) avec colonnes de coût ajoutées.
-
-Contenu
--------
-- `SimplePipeline` : charge les CSV, initialise `CompanyDataLoader`, appelle
-  `project_bilan`, applique les modules de coût sur le bilan historique et
-  le bilan projeté, et retourne un dict contenant les DataFrames.
-
-Usage
------
-- fournir des instances de modules de coûts (ex: `CarbonCost`, `EnergyCost`) qui
-  implémentent `apply(df)`.
-
-"""
+# main.py  (version avec plot)
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Any, List
+import argparse
 from pathlib import Path
+from typing import Optional, Dict
 import pandas as pd
 import logging
 import sys
 
-# Importer le CompanyDataLoader
 try:
-    from data_loader_company import CompanyDataLoader
-except Exception:  # pragma: no cover
-    CompanyDataLoader = None  # type: ignore
+    from CompanyDataLoader import CompanyDataLoader
+except Exception:
+    CompanyDataLoader = None
+    print("NO CORRECT IMPORT")
+
+try:
+    from costs.carbon_cost import CarbonCost
+    from costs.energy_cost import EnergyCost
+except Exception:
+    CarbonCost = None
+    EnergyCost = None
+
+# plotting
+import matplotlib.pyplot as plt
 
 
-class SimplePipeline:
-    """Pipeline minimal adapté aux modules de coût simples.
+def load_bilan_excel(path: str | Path, instrument: Optional[str] = None) -> pd.DataFrame:
+    """Lit l'Excel et renvoie un DataFrame indexé par Date.
 
-    Parameters
-    ----------
-    bilan_path, macro_path : Path | str
-        Chemins vers les CSV.
-    model_paths : dict
-        mapping variable->model_path
-    cost_modules : list
-        liste d'objets simples implémentant `apply(df: pd.DataFrame) -> pd.DataFrame`
-    config : dict
-        paramètres supplémentaires pour la pipeline / modules
+    Ce loader est identique à celui attendu par CompanyDataLoader.
     """
-
-    def __init__(self, bilan_path: str | Path, macro_path: str | Path, model_paths: Dict[str, str] | None = None, cost_modules: List[object] | None = None, config: Dict[str, Any] | None = None):
-        self.bilan_path = Path(bilan_path)
-        self.macro_path = Path(macro_path)
-        self.model_paths = {} if model_paths is None else dict(model_paths)
-        self.cost_modules = [] if cost_modules is None else list(cost_modules)
-        self.config = {} if config is None else dict(config)
-
-        # logger simple
-        self.logger = logging.getLogger(self.__class__.__name__)
-        handler = logging.StreamHandler(sys.stdout)
-        formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-        handler.setFormatter(formatter)
-        if not self.logger.handlers:
-            self.logger.addHandler(handler)
-        self.logger.setLevel(logging.INFO)
-
-    def _load_csv(self, path: Path) -> pd.DataFrame:
-        if not path.exists():
-            raise FileNotFoundError(path)
-        df = pd.read_csv(path, index_col=0, parse_dates=True)
-        return df
-
-    def _apply_costs_chain(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Applique séquentiellement les modules de coût sur `df`.
-
-        Chaque module doit implémenter `apply(df: pd.DataFrame) -> pd.DataFrame`.
-        La fonction retourne la copie finale résultante.
-        """
-        df_curr = df.copy()
-        for mod in self.cost_modules:
-            # api simple : apply(df) -> df
-            try:
-                df_curr = mod.apply(df_curr)
-            except Exception as e:
-                # log léger et continuer (on ne veut pas casser le pipeline pour un module)
-                self.logger.warning("Module %s failed: %s. Skipping this module.", getattr(mod, "__class__", type(mod)), e)
-        return df_curr
-
-    def run(self) -> Dict[str, pd.DataFrame]:
-        """Exécute le pipeline et retourne un dict avec les DataFrames:
-
-        {
-            'bilan_historique': df_historique,
-            'bilan_historique_costed': df_historique_costed,
-            'bilan_proj': df_proj,
-            'bilan_proj_costed': df_proj_costed,
-        }
-        """
-        self.logger.info("Start SimplePipeline (costs-simple)")
-
-        bilan_df = self._load_csv(self.bilan_path)
-        macro_df = self._load_csv(self.macro_path)
-
-        if CompanyDataLoader is None:
-            raise RuntimeError("CompanyDataLoader not importable. Vérifie les chemins.")
-
-        loader = CompanyDataLoader(id="company_main", nace_code=None, bilan=bilan_df)
-        loader.set_variable_model_paths(self.model_paths)
-
-        # projection
-        self.logger.info("Projection du bilan...")
-        loader.project_bilan(macro_df, model_paths=self.model_paths)
-        df_proj = loader.get_bilan_proj()
-
-        # appliquer les modules de coût sur le bilan historique
-        if self.cost_modules:
-            self.logger.info("Application des modules de coût sur le bilan historique...")
-            df_hist_costed = self._apply_costs_chain(bilan_df)
-
-            self.logger.info("Application des modules de coût sur le bilan projeté...")
-            df_proj_costed = self._apply_costs_chain(df_proj)
-        else:
-            df_hist_costed = bilan_df.copy()
-            df_proj_costed = df_proj.copy()
-
-        self.logger.info("Pipeline terminé")
-        return {
-            "bilan_historique": bilan_df,
-            "bilan_historique_costed": df_hist_costed,
-            "bilan_proj": df_proj,
-            "bilan_proj_costed": df_proj_costed,
-        }
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(p)
+    df = pd.read_excel(p, sheet_name=0)
+    df = df.loc[:, [c for c in df.columns if not str(c).startswith("Unnamed")]]
+    if "Date" not in df.columns:
+        raise ValueError("La feuille Excel doit contenir une colonne 'Date'.")
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.set_index("Date").sort_index()
+    if "Instrument" in df.columns:
+        if instrument is None:
+            unique_instr = df["Instrument"].dropna().unique()
+            if len(unique_instr) > 1:
+                raise ValueError(f"Plusieurs instruments trouvés: {list(unique_instr)}. Passe --instrument.")
+            if len(unique_instr) == 1:
+                instrument = unique_instr[0]
+        if instrument is not None:
+            df = df[df["Instrument"] == instrument]
+        df = df.drop(columns=["Instrument"], errors="ignore")
+    for c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
 
 
-# ---------------- Exemple d'utilisation ----------------
-if __name__ == "__main__":
-    # chemins fictifs
-    bilan_path = "data/bilan.csv"
-    macro_path = "data/macro.csv"
+def parse_args(argv=None):
+    p = argparse.ArgumentParser("Main pipeline minimal")
+    p.add_argument("--bilan", required=True, help="Chemin vers le fichier bilan.xlsx")
+    p.add_argument("--instrument", required=False, help="Ticker / instrument à filtrer (col Instrument dans l'Excel)")
+    p.add_argument("--out", required=False, help="Dossier de sortie pour CSV et figure")
+    p.add_argument("--plot-only-top", required=False, type=int, help="(optionnel) ne tracer que les N premières colonnes pour lisibilité")
+    return p.parse_args(argv)
 
-    # exemples : on suppose que tu as les classes CarbonCost et EnergyCost définies
+
+def plot_bilan_with_projection(
+    bilan_hist: pd.DataFrame,
+    bilan_proj: pd.DataFrame,
+    out_dir: Optional[Path] = None,
+    top_n: Optional[int] = None,
+) -> None:
+    """
+    Trace les séries historiques et projetées.
+
+    - bilan_hist : DataFrame indexé par date (historique)
+    - bilan_proj : DataFrame indexé par date (projection)
+    - out_dir : si fourni, dossier où sauvegarder la figure (PNG)
+    - top_n : si fourni, ne tracer que les premières top_n colonnes pour lisibilité
+    """
+    # choisir colonnes à tracer
+    cols = list(bilan_hist.columns)
+    if top_n is not None and top_n > 0:
+        cols = cols[:top_n]
+
+    if not cols:
+        print("Aucune colonne à tracer.")
+        return
+
+    plt.figure(figsize=(12, 6))
+    ax = plt.gca()
+
+    # tracer historique
+    for col in cols:
+        # tracer la série historique (trait plein)
+        if col in bilan_hist.columns:
+            series_hist = pd.to_numeric(bilan_hist[col], errors="coerce")
+            ax.plot(series_hist.index, series_hist.values, linestyle="-", label=f"{col} (hist)")
+
+    # tracer projection (trait pointillé)
+    for col in cols:
+        if col in bilan_proj.columns:
+            series_proj = pd.to_numeric(bilan_proj[col], errors="coerce")
+            ax.plot(series_proj.index, series_proj.values, linestyle="--", label=f"{col} (proj)")
+
+    # belle mise en forme
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Valeur")
+    ax.set_title("Bilan : historique (plein) vs projection (pointillé)")
+    ax.legend(fontsize="small", ncol=2)
+    plt.tight_layout()
+
+    # sauvegarde ou affichage
+    if out_dir is not None:
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        fig_path = out_dir / "bilan_projection.png"
+        plt.savefig(fig_path, dpi=200)
+        print(f"Figure saved to {fig_path}")
+        plt.close()
+    else:
+        plt.show()
+
+
+def main(argv=None):
+    args = parse_args(argv)
+
+    # logger
+    logger = logging.getLogger("main")
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    if not logger.handlers:
+        logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+    logger.info("Chargement du bilan")
+    bilan_df = load_bilan_excel(args.bilan, instrument=args.instrument)
+    logger.info(f"Bilan shape={bilan_df.shape}")
+
+    # préparer macro_df test (3 périodes) — tu peux remplacer par ton API
+    dates = pd.date_range("2025-12-31", periods=20, freq="YE")
+    macro_df = pd.DataFrame({"gdp_growth": [0.02]*20, "inflation": [0.01]*20}, index=dates)
+
+    if CompanyDataLoader is None:
+        raise RuntimeError("CompanyDataLoader non importable. Vérifie le module data_loader_company.py")
+
+    loader = CompanyDataLoader(id=args.instrument or "company", nace_code=None, bilan=bilan_df)
+
+    logger.info("Projection du bilan (mode test)")
+    loader.project_bilan(macro_df, model_paths={})
+    bilan_proj = loader.get_bilan_proj()
+
+    logger.info("Application des coûts simples si disponibles")
+    if CarbonCost is None or EnergyCost is None:
+        logger.warning("Modules de coût non trouvés — les DataFrames seront retournés sans colonnes de coût")
+        bilan_hist_costed = bilan_df.copy()
+        bilan_proj_costed = bilan_proj.copy()
+    else:
+        # pour test: appliquer mêmes facteurs à toutes les colonnes
+        carbon = CarbonCost({col: 0.001 for col in bilan_df.columns})
+        energy = EnergyCost({col: 0.05 for col in bilan_df.columns})
+        bilan_hist_costed = energy.apply(carbon.apply(bilan_df))
+        bilan_proj_costed = energy.apply(carbon.apply(bilan_proj))
+
+    outputs = {
+        "bilan_historique": bilan_df,
+        "bilan_historique_costed": bilan_hist_costed,
+        "bilan_proj": bilan_proj,
+        "bilan_proj_costed": bilan_proj_costed,
+    }
+
+    if args.out:
+        outp = Path(args.out)
+        outp.mkdir(parents=True, exist_ok=True)
+        for name, df in outputs.items():
+            fn = outp / f"{name}.csv"
+            df.to_csv(fn)
+            logger.info(f"Saved {name} -> {fn}")
+
+    # ------------------ PLOTTING ------------------
     try:
-        from costs.carbon_cost import CarbonCost  # type: ignore
-        from costs.energy_cost import EnergyCost  # type: ignore
-
-        carbon = CarbonCost({"chiffre_affaires": 0.001, "resultat_net": 0.002})
-        energy = EnergyCost({"consommation_energie": 0.05})
-        cost_modules = [carbon, energy]
+        top_n = args.plot_only_top if hasattr(args, "plot_only_top") else None
     except Exception:
-        cost_modules = []
+        top_n = None
 
-    p = SimplePipeline(bilan_path=bilan_path, macro_path=macro_path, model_paths={}, cost_modules=cost_modules, config={})
+    # si l'utilisateur a demandé un dossier de sortie, on sauvegarde la figure dedans,
+    # sinon on affiche la fenêtre interactive.
+    out_dir = Path(args.out) if args.out else None
+    # tracer les colonnes du bilan historique et leurs projections
+    plot_bilan_with_projection(bilan_hist=bilan_df, bilan_proj=bilan_proj, out_dir=out_dir, top_n=top_n)
 
-    try:
-        outputs = p.run()
-        print("Bilan projeté costed (extrait):")
-        print(outputs["bilan_proj_costed"].head())
-    except Exception as e:
-        print("Erreur lors du run:", e)
+    logger.info("Done — pipeline minimal terminé")
+    return outputs
+
+
+if __name__ == "__main__":
+    main()
